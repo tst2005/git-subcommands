@@ -1,0 +1,180 @@
+#!/bin/bash
+
+set -e
+
+SUBCMD_STORAGE="$HOME"/.git_subcommands
+
+git_subcmd_config() { git config -f "$SUBCMD_STORAGE" "$@"; }
+git_subcmd_get()  { git_subcmd_config --get "$1"; }
+
+git_subcmd_raw_load() {
+	local storagekey="$1";shift
+	if git_subcmd_get "$storagekey" >&-; then
+		# bash only #
+		#. <(git_subcmd_get "$storagekey" | base64 -d)
+
+		# POSIX shell #
+		local tmp="$(mktemp)"
+		git_subcmd_get "$storagekey" | base64 -d > "$tmp"
+		. $tmp
+		rm -f -- "$tmp"
+	fi
+}
+
+#git_subcmd_load() { git_subcmd_raw_load "alias.$(git_subcmd_storagealias "${1#git-}")"; }
+git_subcmd_load() { git_subcmd_raw_load "alias.$1"; }
+
+_command_found() { command -v "$1" >&-; }
+
+# for git-autoconfig compat
+help_reg() { :; }
+
+git_subcmd_call() {
+	local cmd="${1#--}"; shift
+	cmd="${cmd#./}"
+	#cmd="${cmd#git-}"
+	#gitcmd="git-$cmd"
+	gitcmd="$cmd"
+	if ! _command_found "$gitcmd"; then
+		git_subcmd_load "${keyhash:-$cmd}"
+	fi
+	if ! _command_found "$gitcmd"; then
+		echo >&2  "ERROR: [call] Unknown command '$cmd'"
+		return 1
+	fi
+	"$gitcmd" "$@"
+}
+
+git-subcommands() { git_subcommands "$@"; }
+
+git_subcommands() {
+	local self=git_subcommands
+	local cmd
+	if [ $# -gt 0 ]; then
+		cmd="$1";shift
+	else
+		cmd="help"
+	fi
+	case "$cmd" in
+	(help)
+		echo "Usage: git subcommands <cmd> [<args ...>]"
+		echo "Cmd are:"
+		echo "   list"
+		echo "   get <key>"
+		echo "   set <key> <script-file>"
+		echo "   call <key>"
+	;;
+	(unset)
+		local keyhash="$($self list "$1"|head -1)"
+		[ -n "$keyhash" ] &&
+		$self rawunset "$keyhash"
+	;;
+	(rawunset)	git_subcmd_config --unset "alias.$1" ;;
+	(rawset)	git_subcmd_config "alias.$1" "$(base64 -w0 < "$2")" ;;
+	(set)		$self rawset "$@" ;;
+	(search)
+		local pat
+		case "$1" in
+			(*.*) pat="$1";;
+			(*) pat="${1}"'\..*' ;;
+		esac
+		$self listall | grep -- '^'"$pat"'$' |cut -d. -f1|head -1
+	;;
+	(safeget)
+		$self safelist "$1" |
+		while read -r keyhash; do
+			local key="${keyhash%.hash*}" hash="${keyhash##*.hash}"
+			if [ "$($self rawget "$keyhash" | $self hash)" = "$hash" ]; then
+				$self rawget "$keyhash" && return 0
+			fi
+		done
+	;;
+	(get)
+		$self list "$1" |
+		while read -r k; do
+			if $self rawexists "$k" |grep -q ''; then
+				$self rawget "$k" && return 0
+			fi
+		done
+	;;
+	(rawexists)	git_subcmd_config "alias.$1" ;;
+	(rawget)	git_subcmd_config "alias.$1" | base64 -di ;;
+	(listall)	git_subcmd_config --name-only --get-regexp 'alias\.' '.*' | cut -d. -f2- ;;
+	(safelistall)	$self listall | grep '\.hash' ;;
+	(list)
+		if [ $# -eq 0 ]; then
+			$self listall
+		else
+			$self listall | grep -F -w "$1"
+		fi
+	;;
+	(safelist)
+		if [ $# -eq 0 ]; then
+			$self safelistall
+		else
+			$self safelistall | grep -F -w "$1"
+		fi
+	;;
+	(rawload)	. <($self rawget "$1") ;;
+	(load)		. <($self get "$1") ;;
+	(call)		$self safecall "$@";;
+	(safecall)
+		local keyhash="$($self list "$1")";
+		local key="${keyhash%.hash*}" hash="${keyhash##*.hash}"
+		if [ "$($self rawget "$keyhash" | $self hash)" = "$hash" ]; then
+			$self rawcall "$key" "$hash" "$@"
+		fi
+	;;
+	(rawcall)
+		local key="$1" hash="$2";shift 2;
+		git_subcmd_call "$@"
+	;;
+	(hash)
+		if [ $# -eq 0 ]; then
+			sha1sum | cut -d\  -f1 | cut -b1-20
+		else
+			sha1sum "$@" | cut -d\  -f1
+		fi
+	;;
+	(rename)
+		$self rawset "$2" <($self rawget "$1")
+	;;
+	(rehash)
+		$self hash-set "${1%.hash*}" <($self rawget "$1") &&
+		$self rawunset "$1"
+		# FIXME: bug si le hash est deja bon ca efface l'entree!
+	;;
+	(hash-set)
+		$self rawset "$1.hash$(cat "$2" | $self hash)" "$2"
+	;;
+	(get-hash)
+		$self get "$1" | $self hash
+	;;
+	(*)
+		$self help 2>&1
+		return 1
+	;;
+	esac
+}
+
+git-subcommands "$@"
+
+# TODO:
+# * a way to include ?
+#   . <(git-subcommands get foo)
+
+# * a secure mode, store "key:hash" = "value"
+
+# v1
+#   une entrée bootstrap qui contient la liste des key:hash trusté ?
+#   git-subcommands n'a besoin que de truster le hash du bootstrap ?
+
+# v2
+#   utiliser une donnée secrète, pour hash(secret+value) de facon a avoir des hash locaux
+
+# v3
+#   mixe des 2 ... des hash de contenu key:contenthash:groupname  avec groupname = bootstrap, ou des regroupements, chaque groupe pourrait avoir son propre secret, les trucs communs pourraient avoir un secret vide -> hash commun.
+
+
+# TOSEE:
+# https://mirrors.edge.kernel.org/pub/software/scm/git/docs/gitrevisions.html
